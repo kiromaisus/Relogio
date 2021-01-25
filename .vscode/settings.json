@@ -1,0 +1,21 @@
+{
+    "git.ignoreLimitWarning": true,
+    "files.associations": {
+        "algorithm": "cpp",
+        "istream": "cpp",
+        "limits": "cpp",
+        "streambuf": "cpp",
+        "*.tcc": "cpp",
+        "string": "cpp",
+        "fstream": "cpp",
+        "ctime": "cpp",
+        "array": "cpp",
+        "memory": "cpp",
+        "deque": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "vector": "cpp",
+        "random": "cpp",
+        "initializer_list": "cpp"
+    }
+}
