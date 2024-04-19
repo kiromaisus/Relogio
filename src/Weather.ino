@@ -1,6 +1,5 @@
 // Agradecimentos a Filipe Nicoli
 
-#include "ani.h" //animação
 #include <SPI.h>
 #include <TFT_eSPI.h>    // Hardware-specific library
 #include <ArduinoJson.h> //https://github.com/bblanchon/ArduinoJson.git
@@ -13,6 +12,10 @@
 #include "FreeSans7pt7b.h" // Fonte (caracteres com acentos, principalmente)
 #include "OpenSans-Light.h"
 // #include "BluetoothSerial.h"
+
+#include "esp32-hal-touch.h"
+#include "esp32-hal.h"
+
 
 // Informações para debug via serial
 #define DEBUG
@@ -39,8 +42,8 @@ const int pwmResolution = 8;
 const int pwmLedChannelTFT = 0;
 
 // Informações da wifi
-char *ssid = "ruvian"; //*ssid é o primeiro caractere. ssid é o endereço da string
-char *password = "ruviandc";
+char *ssid[20]; //*ssid é o primeiro caractere. ssid é o endereço da string
+char *password[20];
 String town = "Carlos Barbosa";
 String Country = "BR";
 const String link1 = "http://api.openweathermap.org/data/2.5/weather?q=" + town + "," + Country + "&units=metric&APPID=";
@@ -69,7 +72,7 @@ uint8_t Threshold_Touch = 80; // Quanto menor, menor a sensibilidade
 TaskHandle_t ShowPageWeather_1, GetInfo, print_TFT, Core_0, Core_1, manutencao_TempUmid, attachInterrupt_GetData, attachInterrupt_Display;
 
 // Mutex handlers
-SemaphoreHandle_t Mutex, writeTFT;
+SemaphoreHandle_t Data_Mutex, Core1_Mutex;
 
 // Define NTP Client to get time
 WiFiUDP ntpUDP;
@@ -85,18 +88,19 @@ struct timeval TempoSistema; // O que tem sec e usec
 struct tm DataSistema;       // Data completa
 TFT_eSPI tft = TFT_eSPI();   // Invoke custom library
 bool WasUpdated = false, BT_enabled = false, printed_page = false;
-byte page;
+byte page = 0;
 int httpCode, x_cursor, y_cursor;
 int32_t milis, general_limiter = -500, limiter1 = -500, limiter2 = -5500;
 
+#define Page_Black 0
 #define PageWeather_TempHumi 1
 #define PageWeather_WindCloud 2
 
 #define TFT_WIDTH_3_4 100
-#define TFT_WIDTH_1_2 
+#define TFT_WIDTH_1_2 67
 #define TFT_WIDTH_1_4 33
 
-#define TOUCH_DELAY 500
+#define TOUCH_DELAY 1000
 
 struct Hardware_timer
 {
@@ -118,7 +122,7 @@ struct text
   String numbers[6];
 };
 
-text Screen1, Screen2;
+text Screen[7];
 
 // BluetoothSerial BT;
 
@@ -148,6 +152,11 @@ text Screen1, Screen2;
  Não tem como deixar o ESP dormindo enquanto a tela estiver ligada e querer que tenha os botões touch funcionando
  porque quando ele acordar vai piscar a tela e isso fica feio, além do PWM do display só poder ser feito quando acordado
 
+ Core1_Mutex serve pra evitar conflitos de timer escrevendo na tela e touch mandando escrever também
+ Se mudar a frequência e escrever na tela também dá conflito
+
+ Data_Mutex serve pra evitar conflitos de leitura e escrita ao mesmo tempo numa mesma variável
+
  -Ver de adicionar o bluetooth
  -Implementar quebras de linha sem quebrar palavras
 
@@ -173,16 +182,20 @@ Esquerdo-Jogos?
 Direito-
 
 */
-void setup(void)
+void setup(void) // Core 1
 {
-  setCpuFrequencyMhz(10); // Começa com essa função porque os botões touch não foram inicalizados ainda
+  setCpuFrequencyMhz(240); // Começa com essa função porque os botões touch não foram inicalizados ainda
 #ifdef DEBUG
   Serial.begin(115200); // serial tem que começar logo pra poder debugar
 #endif
-  esp_sleep_enable_timer_wakeup(60000000); //acorda após 60s
+  // esp_sleep_enable_timer_wakeup(60000000); //acorda após 60s
   // esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0); // desabilita o botão esquerdo
+  Core1_Mutex = xSemaphoreCreateMutex();
+  Data_Mutex = xSemaphoreCreateMutex();
 
-  Mutex = xSemaphoreCreateMutex();
+  // strcpy(ssid[0], "Ruvian");
+  // strcpy(password[0], "transistor");
+
   Serial.println();
   debug(F(__DATE__));
   debug(F(__TIME__));
@@ -223,19 +236,21 @@ void Setup() // Setup que é rodado depois de saber o que acordou o microcontrol
   TFTinitAndPWMDisplay();
   OnceAfterReset_TFTthings();
   timeClient.setTimeOffset(-10800); // Só precisa definir isso 1 vez a cada reset
-  Core1();
-  InitTimerPrintValues();
+  Core1();                          // Para escrever o horário antes de 1 segundo após iniciar
+  // InitTimerPrintValues();
   DefineScreenPhysicalQuantities();
   debug("Fim Setup()");
 }
 
-void IRAM_ATTR TouchButton(void *arg) // system task, core0
+void IRAM_ATTR TouchButton(void *arg) // system task, core 0
 {
   // esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TOUCHPAD); // enquanto o ESP for acordado pelo botão esquerdo, isso fica comentado
   touch_pad_intr_disable();
   uint32_t touch_pin_mask = touch_pad_get_status();
   touch_pad_clear_status();
+
   debug("Button " + String(touch_pin_mask) + " touched");
+  xSemaphoreTake(Data_Mutex, 500);
 
   switch (touch_pin_mask)
   {
@@ -246,7 +261,7 @@ void IRAM_ATTR TouchButton(void *arg) // system task, core0
       general_limiter = millis();
     }
     break;
-  case 8: // GPIO 15
+  /*case 8: // GPIO 15
     break;
   case 16: // GPIO 13
     if (millis() > general_limiter + TOUCH_DELAY)
@@ -269,11 +284,14 @@ void IRAM_ATTR TouchButton(void *arg) // system task, core0
       general_limiter = millis();
       if (page > 0)
       {
+        // (firstTime) ? firstTime = false :
         page--;
+        printed_page = false;
+        // debug(String(page));
         GiveCore1ShowPageWeather();
       }
     }
-    break;
+    break;*/
   case 128: // GPIO 27
     // debug("limiter1=" + String(limiter1));
     // debug("g_limiter=" + String(general_limiter));
@@ -284,6 +302,9 @@ void IRAM_ATTR TouchButton(void *arg) // system task, core0
       if (page < 7)
       {
         page++;
+        printed_page = false;
+        // debug(String(page));
+        debug("page++");
         GiveCore1ShowPageWeather();
       }
     }
@@ -306,8 +327,10 @@ void IRAM_ATTR TouchButton(void *arg) // system task, core0
     Serial.print("Multiple touch");
     break;
   }
-  debug("Fim touch");
   touch_pad_intr_enable();
+  xSemaphoreGive(Data_Mutex);
+
+  debug("Fim touch");
 }
 
 void BotaoDireito()
@@ -333,18 +356,23 @@ void BotaoEsquerdo()
 
 void SetFrequencyAndAdjustTimers(int freq)
 {
+  xSemaphoreTake(Core1_Mutex, 500);
   debug("SetFrequencyAndAdjustTimers()");
-  setCpuFrequencyMhz(freq);
-  InitTimerPrintValues();
-  if (Timer.turnOffBT != NULL) // Se o timer já foi chamado alguma vez
-  {
-    if (timerStarted(Timer.turnOffBT)) // Se está iniciado
-    {
-      uint64_t time_BT = timerRead(Timer.turnOffBT); // Lê o valor de tempo atual
-      InitTimerBT();
-      timerWrite(Timer.turnOffBT, time_BT); // Escreve o valor de tempo para continuar contando
-    }
-  }
+  // setCpuFrequencyMhz(freq);
+  debug("Set 1");
+  // InitTimerPrintValues();
+  // if (Timer.turnOffBT != NULL) // Se o timer já foi chamado alguma vez
+  // {
+  //   if (timerStarted(Timer.turnOffBT)) // Se está iniciado
+  //   {
+  //     uint64_t time_BT = timerRead(Timer.turnOffBT); // Lê o valor de tempo atual
+  //     InitTimerBT();
+  //     timerWrite(Timer.turnOffBT, time_BT); // Escreve o valor de tempo para continuar contando
+  //   }
+  // }
+  debug("Set 2");
+  xSemaphoreGive(Core1_Mutex);
+  debug("Fim SetFrequencyAndAjustTimers()");
 }
 
 void InitTimerPrintValues()
@@ -354,6 +382,7 @@ void InitTimerPrintValues()
   timerAttachInterrupt(Timer.printValues, &Core1, true);
   timerAlarmWrite(Timer.printValues, 1000000, true); // a cada 1 s
   timerAlarmEnable(Timer.printValues);
+  debug("Fim InitTimerPrintValues()");
 }
 
 void InitTimerBT()
@@ -366,10 +395,12 @@ void InitTimerBT()
     timerAlarmWrite(Timer.turnOffBT, 1 * 60 * 1000000, false);
     timerAlarmEnable(Timer.turnOffBT);
   }
+  debug("Fim InitTimerBT()");
 }
 
 void Core1() //void *parameter)
 {
+  xSemaphoreTake(Core1_Mutex, 500);
   // while (1)
   // {
   // debug("printValues");
@@ -381,8 +412,7 @@ void Core1() //void *parameter)
   printTimeValues();
   // debug("loop 3");
   // gpio_deep_sleep_hold_en(); //volta a habilitar o gpio hold
-  // }
-  // vTaskDelete(NULL); //não é mais task
+  xSemaphoreGive(Core1_Mutex);
 }
 
 void Core0(void *parameter)
@@ -397,6 +427,9 @@ void printTimeValues() //core1
 {
   GetSystemTimeLoadedIntoVariables();
   // debug("PrintValues inicio");
+
+  xSemaphoreTake(Data_Mutex, 500);
+
   // Hora
   tft.setTextColor(deep_sky_blue, TFT_BLACK); //cor da hora
   if (strcmp(timeStamp, tt) != 0)             //só atualiza se precisar
@@ -428,23 +461,26 @@ void printTimeValues() //core1
   tft.setTextColor(TFT_GREEN, TFT_BLACK);               //cor da data
   tft.setFreeFont(NULL);                                //importante
   tft.drawCentreString(dayStamp, TFT_WIDTH / 2, 35, 2); //valor da data
+
+  xSemaphoreGive(Data_Mutex);
+
   // debug("PrintValues fim");
 }
 
-void PrintInfoTexts(text Screen)
+void PrintInfoTexts(text Screen) // Core1
 {
   tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
   tft.setTextFont(2);
   tft.setCursor(4, 122);
-  tft.println(Screen1.texto[0]);
+  tft.println(Screen.texto[0]);
   tft.setCursor(80, 122);
-  tft.println(Screen1.texto[1]);
+  tft.println(Screen.texto[1]);
   tft.setCursor(4, 162);
-  tft.println(Screen1.texto[2]);
+  tft.println(Screen.texto[2]);
   tft.setCursor(80, 162);
-  tft.println(Screen1.texto[3]);
+  tft.println(Screen.texto[3]);
   tft.setCursor(4, 202);
-  tft.println(Screen1.texto[4]);
+  tft.println(Screen.texto[4]);
   tft.setCursor(80, 205);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextFont(1);
@@ -462,8 +498,8 @@ void PrintInfoTexts(text Screen)
     // char array recebe HH:MM a partir de uma struct tm
     strftime(Data.timeStamp, 6, "%H:%M", &Data.struct_last_updated);
     // tft.setCursor(0, 90);
-    tft.drawString(Data.town, TFT_WIDTH / 2, 90);
-    String extended_timeStamp = Data.timeStamp;
+    tft.drawString(Data.town, TFT_WIDTH_1_2, 90);
+    String extended_timeStamp = String(Data.timeStamp) + ", ";
     // tm_yday é dia do ano (1-365)
     if (Data.struct_last_updated.tm_yday == DataSistema.tm_yday) //DataSistema está sempre atualzando
     {
@@ -481,7 +517,7 @@ void PrintInfoTexts(text Screen)
     {
       extended_timeStamp += "muito tempo";
     }
-    tft.drawString(extended_timeStamp, TFT_WIDTH / 2, 105);
+    tft.drawString(extended_timeStamp, TFT_WIDTH_1_2, 105);
   }
 }
 
@@ -496,13 +532,15 @@ void ShowWhenWasUpdated()
     tft.print("Atualizado `");
     tft.setCursor(1, 67);
     tft.print("Atualizado as ");
+
+    xSemaphoreTake(Data_Mutex, 500);
     // struct tm recebe struct gerada a partir de um dt em unix
     Data.struct_last_updated = *gmtime(&Data.updated_dt); // converte pra formato usual
     // char array recebe HH:MM a partir de uma struct tm
     strftime(Data.timeStamp, 6, "%H:%M", &Data.struct_last_updated);
     tft.print(Data.timeStamp);
     // tm_yday é dia do ano (1-365)
-    if (Data.struct_last_updated.tm_yday == DataSistema.tm_yday) //DataSistema está sempre atualzando
+    if (Data.struct_last_updated.tm_yday == DataSistema.tm_yday) //DataSistema está sempre atualizando
     {
       tft.print(", hoje");
     }
@@ -522,32 +560,53 @@ void ShowWhenWasUpdated()
       // tft.setCursor(x_cursor, y_cursor);
       // tft.print("h´");
     }
+    xSemaphoreGive(Data_Mutex);
     tft.setFreeFont(NULL);
   }
 }
 
 void ShowPageWeather(void *pValue)
 {
-  debug("ShowPageWeather inicio");
+  //  SetFrequencyAndAdjustTimers(80); // VROOOOOOOOOOOOM
+
+  debug("ShowPageWeather inicio"); /*
+  xSemaphoreTake(Core1_Mutex, 500);
+  xSemaphoreTake(Data_Mutex, 500);
   if ((!printed_page) || (WasUpdated))
   {
+    debug("Page=" + String(page));
     // Desabilita a atualização de valores de tempo enquanto estiver escrevendo outras coisas na tela
     // Necessário para gerenciar prioridades entre timers e tasks
-    timerDetachInterrupt(Timer.printValues);
-    timerAlarmDisable(Timer.printValues);
+    // timerDetachInterrupt(Timer.printValues);
+    // timerAlarmDisable(Timer.printValues);
+    // timerEnd(Timer.printValues);
+    // debug("aqui 2");
     printed_page = true;
     WasUpdated = false;
+    // debug("aqui 3");
+
+    if (page == Page_Black)
+    {
+      ClearScreenForPages(55);
+    }
+    // debug("aqui 4");
+
     if (page == PageWeather_TempHumi)
     {
+      // debug("aqui 4.1");
       ClearScreenForPages(55); // Limpa tela de y=55 em diante
       tft.setTextSize(1);
       // ShowWhenWasUpdated();
-      PrintInfoTexts(Screen1);
+
+      // debug("aqui 4.2");
+      PrintInfoTexts(Screen[PageWeather_TempHumi]);
 
       // Temperatura
       tft.setFreeFont(&Orbitron_Medium_20);
       tft.setTextColor(TFT_CYAN, TFT_BLACK);
       tft.setTextDatum(BC_DATUM);
+
+      // debug("aqui 4.3");
       (Data.temperature != NULL) ? tft.drawString(Data.temperature, TFT_WIDTH_1_4, 147 + 13) : tft.drawString("?", TFT_WIDTH_1_4, 147 + 13);
 
       // Temperatura mínima
@@ -562,34 +621,44 @@ void ShowPageWeather(void *pValue)
       // Umidade
       (Data.humidity != NULL) ? tft.drawString(Data.humidity + "%", TFT_WIDTH_1_4, 227 + 13) : tft.drawString("?", TFT_WIDTH_1_4, 227 + 13);
     }
+    // debug("aqui 5");
+
     if (page == PageWeather_WindCloud)
     {
       tft.setTextSize(1);
       // ShowWhenWasUpdated();
+      // debug("aqui 5.1");
       ClearScreenForPages(55); // Limpa tela de y=55 em diante
-      PrintInfoTexts(Screen2);
+      // debug("aqui 5.2");
+      PrintInfoTexts(Screen[PageWeather_WindCloud]);
       // Temperatura
       tft.setFreeFont(&Orbitron_Medium_20);
       tft.setTextColor(TFT_CYAN, TFT_BLACK);
       tft.setTextDatum(BC_DATUM);
+
+      // Velocidade do vento
       (Data.wind_speed != NULL) ? tft.drawString(Data.wind_speed, TFT_WIDTH_1_4, 147 + 13) : tft.drawString("?", TFT_WIDTH_1_4, 147 + 13);
 
-      // Temperatura mínima
+      // Ângulo do vento
       (Data.wind_degree != 0) ? tft.drawString(String(Data.wind_degree), TFT_WIDTH_3_4, 147 + 13) : tft.drawString("?", TFT_WIDTH_3_4, 147 + 13);
 
-      // Sensação térmica
+      // Rajada
       (Data.gust != NULL) ? tft.drawString(Data.gust, TFT_WIDTH_1_4, 187 + 13) : tft.drawString("?", TFT_WIDTH_1_4, 187 + 13);
 
-      // Temperatura Máxima
+      // Chuva
       (Data.rain != NULL) ? tft.drawString(Data.rain, TFT_WIDTH_3_4, 187 + 13) : tft.drawString("?", TFT_WIDTH_3_4, 187 + 13);
 
-      // Umidade
+      // % de nuvens
       (Data.cloudiness != NULL) ? tft.drawString(Data.cloudiness + "%", TFT_WIDTH_1_4, 227 + 13) : tft.drawString("?", TFT_WIDTH_1_4, 227 + 13);
     }
-    PrintBrightnessBars();
-    timerAttachInterrupt(Timer.printValues, &Core1, true);
-    timerAlarmEnable(Timer.printValues);
+    if (page != Page_Black)
+      PrintBrightnessBars();
+    // timerAttachInterrupt(Timer.printValues, &Core1, true);
+    // timerAlarmEnable(Timer.printValues);
   }
+  xSemaphoreGive(Data_Mutex);
+  xSemaphoreGive(Core1_Mutex);
+  // SetFrequencyAndAdjustTimers(10); // Lesma */
   vTaskDelete(NULL);
 }
 
@@ -599,7 +668,7 @@ void getData() //core 0 executando
   SetFrequencyAndAdjustTimers(80); //__________________________________________________________________________________________________________
   debug("inicio wifi");
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  WiFi.begin(ssid[0], password[0]);
   debug("wifi conectando");
   TempoConexaoWifi = millis();
   while ((WiFi.status() != WL_CONNECTED) && ((millis() - TempoConexaoWifi) < 5000)) //contar o tempo aqui pra não dar crash
@@ -651,6 +720,7 @@ void getData() //core 0 executando
   SetFrequencyAndAdjustTimers(10); //__________________________________________________________________________________________________________
   debug("10MHz");
   char inp[1000];
+  // Payload 1
   payload1.toCharArray(inp, 1000);
   deserializeJson(doc, inp);
   String tmp = doc["main"]["temp"];
@@ -664,31 +734,40 @@ void getData() //core 0 executando
   String cloudiness = doc["clouds"]["all"];
   String town = doc["name"];
 
+  // Payload 2
   payload2.toCharArray(inp, 1000);
   deserializeJson(doc, inp);
   String rain = doc["list"]["sys"]["rain"];
 
-  xSemaphoreTake(Mutex, 50);
+  xSemaphoreTake(Data_Mutex, 50);
   Data.feels_like = feels_like.substring(0, 4);
   Data.max_temperature = temp_max.substring(0, 4);
   Data.min_temperature = temp_min.substring(0, 4);
   Data.temperature = tmp.substring(0, 4);
   Data.wind_speed = wind_speed;
   if (wind_degree > 180)
-    Data.wind_degree -= 360;
+  {
+    Data.wind_degree = wind_degree - 360;
+  }
+  else
+  {
+    Data.wind_degree = wind_degree;
+  }
   Data.gust = gust;
   Data.humidity = hum;
   Data.cloudiness = cloudiness;
   Data.town = town;
   Data.struct_last_updated.tm_sec = Data.updated_dt;
   Data.rain = rain;
+  if (Data.rain == "null")
+    Data.rain = "0";
   if (WasUpdated)
   {
     Data.updated_dt = timeClient.getEpochTime();
     TempoSistema.tv_sec = Data.updated_dt;
     settimeofday(&TempoSistema, NULL);
   }
-  xSemaphoreGive(Mutex);
+  xSemaphoreGive(Data_Mutex);
   // debug(String(dt));
   // esp_sleep_enable_touchpad_wakeup(); // enquanto o botão esquerdo acordar o ESP, isso vai ficar comentado
 }
@@ -701,15 +780,15 @@ void SetupEverythingAboutTouchButtons()
   touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER);
   // Pinos à esquerda
   touch_pad_config(TOUCH_PAD_GPIO2_CHANNEL, Threshold_Touch);
-  touch_pad_config(TOUCH_PAD_GPIO15_CHANNEL, Threshold_Touch);
-  touch_pad_config(TOUCH_PAD_GPIO13_CHANNEL, Threshold_Touch);
-  touch_pad_config(TOUCH_PAD_GPIO12_CHANNEL, Threshold_Touch);
+  // touch_pad_config(TOUCH_PAD_GPIO15_CHANNEL, Threshold_Touch);
+  // touch_pad_config(TOUCH_PAD_GPIO13_CHANNEL, Threshold_Touch);
+  // touch_pad_config(TOUCH_PAD_GPIO12_CHANNEL, Threshold_Touch);
   // Pinos à direita
   touch_pad_config(TOUCH_PAD_GPIO27_CHANNEL, Threshold_Touch);
   touch_pad_config(TOUCH_PAD_GPIO33_CHANNEL, Threshold_Touch);
   touch_pad_config(TOUCH_PAD_GPIO32_CHANNEL, Threshold_Touch);
   touch_pad_isr_register(TouchButton, NULL); //registra ISR com a função TouchButton
-  touch_pad_set_meas_time((int)21000,        //Máximo 65535 - ciclos dormindo a 150 kHz - ajustar o tempo dormindo como forma de sensibilidade temporal
+  touch_pad_set_meas_time((int)65535,        //21000,        //Máximo 65535 - ciclos dormindo a 150 kHz - ajustar o tempo dormindo como forma de sensibilidade temporal
                           (int)3000);        //Máximo 32767 - ciclos medindo a 8 MHz - tempo suficiente para medir amostras e ter um bom resultado
   // touch_pad_intr_enable();                   // aqui habilita a interrupção
 }
@@ -749,13 +828,13 @@ void TFTinitAndPWMDisplay()
 void GetSystemTimeLoadedIntoVariables()
 {
   // debug("GetSystemTimeLoadedIntoVariables()");
-  xSemaphoreTake(Mutex, 50);
+  xSemaphoreTake(Data_Mutex, 50);
   TempoSistema.tv_sec = time(NULL);            // busca o tempo Unix do sistema
   DataSistema = *gmtime(&TempoSistema.tv_sec); // converte pra formato usual
   strftime(dayStamp, 20, "%d/%m/%Y", &DataSistema);
   strftime(timeStamp, 6, "%H:%M", &DataSistema);
   strftime(secondStamp, 3, "%S", &DataSistema);
-  xSemaphoreGive(Mutex);
+  xSemaphoreGive(Data_Mutex);
   // debug(String(data.tm_mday));
   // debug(String(data.tm_mon+1));
   // debug(String(data.tm_year));
@@ -786,17 +865,17 @@ void PrintBrightnessBars()
 
 void DefineScreenPhysicalQuantities()
 {
-  Screen1.texto[0] = "TEMP:";
-  Screen1.texto[1] = "MIN:";
-  Screen1.texto[2] = "SENS.:";
-  Screen1.texto[3] = "MAX:";
-  Screen1.texto[4] = "UMI:";
+  Screen[1].texto[0] = "TEMP:";
+  Screen[1].texto[1] = "MIN:";
+  Screen[1].texto[2] = "SENS.:";
+  Screen[1].texto[3] = "MAX:";
+  Screen[1].texto[4] = "UMI:";
 
-  Screen2.texto[0] = "VENTO:";
-  Screen2.texto[1] = "ANGULO:";
-  Screen2.texto[2] = "RAJADA:";
-  Screen2.texto[3] = "CHUVA:";
-  Screen2.texto[4] = "NEBU.:";
+  Screen[2].texto[0] = "VENTO:";
+  Screen[2].texto[1] = "ANGULO:";
+  Screen[2].texto[2] = "RAJADA:";
+  Screen[2].texto[3] = "CHUVA:";
+  Screen[2].texto[4] = "NEBU.:";
 }
 
 void debug(String estado) //os 2 cores
@@ -854,7 +933,7 @@ void GiveCore1ShowPageWeather()
   xTaskCreatePinnedToCore(
       ShowPageWeather,    /* Function to implement the task */
       "ShowPageWeather",  /* Name of the task */
-      10000,              /* Stack size in words */
+      1000,               /* Stack size in words */
       NULL,               /* Task input parameter */
       2,                  /* Priority of the task */
       &ShowPageWeather_1, /* Task handle. */
